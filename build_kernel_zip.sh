@@ -30,15 +30,16 @@ cleanup_tmp() {
     [[ -n "$TMP_ZIP_STAGING"  && -d "$TMP_ZIP_STAGING"  ]] && rm -rf "$TMP_ZIP_STAGING"
     [[ -n "$TMP_BOOT"         && -d "$TMP_BOOT"         ]] && rm -rf "$TMP_BOOT"
     [[ -n "$TMP_VENDOR_BOOT"  && -d "$TMP_VENDOR_BOOT"  ]] && rm -rf "$TMP_VENDOR_BOOT"
+    return 0
 }
 trap cleanup_tmp EXIT
 
 # ─── Hardcoded config ─────────────────────────────────────────────────────────
-AUTHOR="bone-machine"
+AUTHOR="${AUTHOR:-skb8}"
 DEVICE="a52sxq"
 # Change these to your own values before building
-KBUILD_BUILD_USER="bone-machine"
-KBUILD_BUILD_HOST="rios"
+KBUILD_BUILD_USER="${KBUILD_BUILD_USER:-skb8}"
+KBUILD_BUILD_HOST="${KBUILD_BUILD_HOST:-github-actions}"
 CLANG_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r530567.tar.gz"
 MAGISK_APK_URL="https://github.com/topjohnwu/Magisk/releases/download/v30.7/Magisk-v30.7.apk"
 # avbtool — downloaded from AOSP main branch
@@ -107,8 +108,7 @@ fi
 # KernelSU-Next lives in the "KernelSU-Next" submodule.
 # ReSukiSU lives in the "KernelSU" submodule.
 #
-# Both root solutions use the latest tag returned by:
-#   cd <submodule> && git tag -l
+# Root versions describe the checkout actually being compiled.
 #
 # The branch name is also used to determine whether SUSFS is enabled.
 ROOT_SOLUTION="none"
@@ -133,8 +133,8 @@ case "$CURRENT_BRANCH" in
         fi
         ;;
 
-    resukisu*)
-        ROOT_SOLUTION="ReSukiSU"
+    resukisu*|bakasu*)
+        ROOT_SOLUTION="BakaSU"
         ROOT_SUBMODULE_DIR="${KERNEL_ROOT}/KernelSU"
 
         if [[ "$CURRENT_BRANCH" == *susfs* ]]; then
@@ -150,31 +150,18 @@ case "$CURRENT_BRANCH" in
         ;;
 esac
 
-# Detect root solution version from submodule tags.
-#
-# The requested behavior is equivalent to:
-#   cd KernelSU
-#   git tag -l
-#
-# and using the latest tag listed by git as the displayed version.
+# Initialize the pinned checkout. Never replace an Actions build with a release tag.
 if [[ "$ROOT_SOLUTION" != "none" ]]; then
-    [[ -d "$ROOT_SUBMODULE_DIR" ]] \
-        || die "${ROOT_SOLUTION} submodule directory not found: ${ROOT_SUBMODULE_DIR}"
-
-    mapfile -t ROOT_TAGS < <(git -C "$ROOT_SUBMODULE_DIR" tag -l)
-
-    if (( ${#ROOT_TAGS[@]} == 0 )); then
-        ROOT_VERSION="unknown"
-        warn "No tags found in ${ROOT_SOLUTION} submodule"
-    else
-        ROOT_VERSION="${ROOT_TAGS[$((${#ROOT_TAGS[@]} - 1))]}"
+    git -C "$KERNEL_ROOT" submodule sync --recursive
+    git -C "$KERNEL_ROOT" submodule update --init --recursive
+    if [[ "$ROOT_SOLUTION" == "BakaSU" && -n "${BAKASU_REF:-}" ]]; then
+        [[ "$BAKASU_REF" =~ ^[0-9a-f]{40}$ ]] || die "BAKASU_REF must be a full commit SHA"
+        git -C "$ROOT_SUBMODULE_DIR" fetch origin "$BAKASU_REF"
+        git -C "$ROOT_SUBMODULE_DIR" checkout --detach "$BAKASU_REF"
     fi
-
+    ROOT_VERSION="$(git -C "$ROOT_SUBMODULE_DIR" describe --tags --always --abbrev=8)"
     ROOT_DISPLAY="${ROOT_SOLUTION} ${ROOT_VERSION}"
-
-    if [[ "$HAS_SUSFS" == true ]]; then
-        ROOT_DISPLAY+=" + SUSFS"
-    fi
+    if [[ "$HAS_SUSFS" == true ]]; then ROOT_DISPLAY+=" + SUSFS"; fi
 fi
 
 # ZIP name
@@ -191,8 +178,8 @@ else
 fi
 
 # ─── Sanity checks ────────────────────────────────────────────────────────────
-[[ "$(basename "$KERNEL_ROOT")" == "android_kernel_samsung_sm7325_a52s_5g" ]] \
-    || die "Run this script from the kernel root (android_kernel_samsung_sm7325_a52s_5g/)"
+[[ -f "${KERNEL_ROOT}/Makefile" && -d "${KERNEL_ROOT}/arch/arm64" ]] \
+    || die "Kernel source tree not found"
 
 for cmd in curl unzip zip cpio find sed git uname tar grep nproc cp chmod depmod python3; do
     command -v "$cmd" &>/dev/null || die "Required command not found: $cmd"
@@ -261,8 +248,10 @@ success "Pre-flight checks passed"
 git -C "${KERNEL_ROOT}" rev-parse --git-dir >/dev/null 2>&1 \
     || die "Kernel root is not a git repository"
 
-info "Updating git submodules..."
-git -C "${KERNEL_ROOT}" submodule update --init --recursive
+info "Checking git submodules..."
+if [[ "$ROOT_SOLUTION" == "none" ]]; then
+    git -C "$KERNEL_ROOT" submodule update --init --recursive
+fi
 success "Submodules up to date"
 
 # ─── Step 2: Clang toolchain ──────────────────────────────────────────────────
@@ -272,7 +261,7 @@ if [[ -x "${CLANG_DIR}/bin/clang" ]] &&
 else
     info "Downloading Clang toolchain..."
     TMP_CLANG="$(mktemp -d)"
-    curl -L --progress-meter "$CLANG_URL" -o "${TMP_CLANG}/clang.tar.gz" \
+    curl --fail --retry 3 -L --progress-meter "$CLANG_URL" -o "${TMP_CLANG}/clang.tar.gz" \
         || die "Failed to download Clang"
     info "Extracting Clang (this may take a while)..."
     rm -rf "$CLANG_DIR"
@@ -299,7 +288,7 @@ if [[ -x "$MAGISKBOOT_BIN" ]]; then
 else
     info "Downloading Magisk APK to extract magiskboot..."
     TMP_MAGISK="$(mktemp -d)"
-    curl -L --progress-meter "$MAGISK_APK_URL" -o "${TMP_MAGISK}/Magisk.apk" \
+    curl --fail --retry 3 -L --progress-meter "$MAGISK_APK_URL" -o "${TMP_MAGISK}/Magisk.apk" \
         || die "Failed to download Magisk APK"
     info "Extracting Magisk APK..."
     unzip -q "${TMP_MAGISK}/Magisk.apk" -d "${TMP_MAGISK}/extracted" \
@@ -331,7 +320,7 @@ else
     info "Downloading avbtool..."
     TMP_AVBTOOL="$(mktemp)"
     # The URL returns base64-encoded content — decode it to get the Python script
-    curl -L --progress-meter "$AVBTOOL_URL" \
+    curl --fail --retry 3 -L --progress-meter "$AVBTOOL_URL" \
         | base64 -d > "$TMP_AVBTOOL" \
         || die "Failed to download avbtool"
     # Verify it's actually avbtool and not a corrupted download or HTML error page
@@ -370,7 +359,8 @@ avbtool erase_footer --image "${TMP_VENDOR_BOOT}/vendor_boot.img" 2>/dev/null ||
 # SAMSUNG_SEANDROID is a Samsung-specific boot image marker present in One UI images
 # and absent in AOSP images for this device — reliable enough for our purposes
 info "Validating boot.img matches expected ROM type (${ROM_TYPE})..."
-BOOT_UNPACK_OUTPUT="$(magiskboot unpack "${TMP_BOOT}/boot.img" 2>&1 || true)"
+BOOT_UNPACK_OUTPUT="$(cd "$TMP_BOOT" && magiskboot unpack boot.img 2>&1)" \
+    || die "Failed to validate boot.img"
 rm -f "${TMP_BOOT}/kernel" "${TMP_BOOT}/ramdisk.cpio"
 
 if [[ "$ROM_TYPE" == "One-UI" ]]; then
@@ -388,10 +378,21 @@ info "Wiping out/ from previous build..."
 rm -rf "${OUT_DIR}"
 success "Clean done"
 
+# Use the same compiler settings during configuration, build and modules_install.
+export ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1
+export CROSS_COMPILE=aarch64-linux-gnu-
+export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+
 # ─── Step 8: Defconfig ───────────────────────────────────────────────────────
 info "Generating defconfig..."
 make -C "${KERNEL_ROOT}" O="${OUT_DIR}" ARCH=arm64 vendor/a52sxq_kor_single_defconfig \
     || die "defconfig failed"
+# Resolve new options without waiting for terminal input in Actions.
+make -C "$KERNEL_ROOT" O="$OUT_DIR" olddefconfig
+if [[ "$ROOT_SOLUTION" == "BakaSU" ]]; then
+    grep -qx 'CONFIG_KSU=y' "$OUT_DIR/.config" || die "BakaSU is disabled"
+    grep -qx 'CONFIG_KSU_MANUAL_HOOK=y' "$OUT_DIR/.config" || die "Manual hooks are disabled"
+fi
 success "Defconfig generated"
 
 # ─── Step 9: Kernel build ────────────────────────────────────────────────────
