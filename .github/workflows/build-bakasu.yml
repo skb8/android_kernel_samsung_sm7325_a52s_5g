@@ -1,0 +1,130 @@
+name: Build A52s BakaSU
+run-name: A52s BakaSU - ${{ github.event_name }}
+on:
+  workflow_dispatch:
+    inputs:
+      bakasu_sha:
+        description: 'BakaSU full commit SHA (empty = latest successful main Manager build)'
+        required: false
+        type: string
+      rom:
+        description: ROM variant
+        type: choice
+        default: both
+        options: [both, oneui, aosp]
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-bakasu.yml']
+permissions:
+  contents: read
+concurrency:
+  group: bakasu-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  source:
+    runs-on: ubuntu-22.04
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      run_url: ${{ steps.source.outputs.run_url }}
+      matrix: ${{ steps.source.outputs.matrix }}
+    steps:
+      - uses: actions/github-script@v7
+        id: source
+        env:
+          REQUESTED_SHA: ${{ inputs.bakasu_sha }}
+          ROM: ${{ inputs.rom }}
+        with:
+          script: |
+            const requested = process.env.REQUESTED_SHA;
+            let sha = requested;
+            let runUrl = '';
+            if (requested && !/^[0-9a-f]{40}$/.test(requested)) {
+              throw new Error('Provide a full 40-character BakaSU commit SHA');
+            }
+            if (!sha) {
+              for (let page = 1; page <= 10; page++) {
+                const {data} = await github.rest.actions.listWorkflowRunsForRepo({
+                  owner: 'Baka-SU', repo: 'BakaSU', branch: 'main',
+                  status: 'success', event: 'push', per_page: 100, page
+                });
+                const run = data.workflow_runs.find(r => r.name === 'Build Manager');
+                if (run) {
+                  const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+                    owner: 'Baka-SU', repo: 'BakaSU', run_id: run.id, per_page: 100
+                  });
+                  if (!artifacts.some(a => a.name === 'Manager-release' && !a.expired)) {
+                    throw new Error('Latest Manager build has no available Manager-release artifact');
+                  }
+                  sha = run.head_sha;
+                  runUrl = run.html_url;
+                  break;
+                }
+                if (data.workflow_runs.length < 100) break;
+              }
+              if (!sha) throw new Error('No successful BakaSU main Manager build found');
+            }
+            const roms = process.env.ROM && process.env.ROM !== 'both' ? [process.env.ROM] : ['oneui', 'aosp'];
+            core.setOutput('sha', sha);
+            core.setOutput('run_url', runUrl);
+            core.setOutput('matrix', JSON.stringify({rom: roms}));
+            await core.summary.addHeading('BakaSU source')
+              .addRaw(`Commit: ${sha}\n\nManager artifacts: ${runUrl || 'custom SHA; select a matching manager'}\n`).write();
+  build:
+    needs: source
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.source.outputs.matrix) }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      BAKASU_REF: ${{ needs.source.outputs.sha }}
+      MANAGER_RUN_URL: ${{ needs.source.outputs.run_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bakasu-${{ matrix.rom }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev \
+            curl git zip unzip cpio python3 kmod binutils-aarch64-linux-gnu \
+            binutils-arm-linux-gnueabi
+      - name: Build kernel and flashable ZIP
+        shell: bash
+        run: |
+          set -o pipefail
+          bash build_kernel_zip.sh 2>&1 | tee build.log
+      - name: Record exact sources
+        if: always()
+        run: |
+          {
+            echo "Kernel: $(git rev-parse HEAD)"
+            echo "BakaSU requested: $BAKASU_REF"
+            if [ -f KernelSU/.git ]; then
+              echo "BakaSU built: $(git -C KernelSU rev-parse HEAD)"
+              echo "BakaSU version code: $((30000 + $(git -C KernelSU rev-list --count HEAD) + 700))"
+            fi
+            echo "Manager: $MANAGER_RUN_URL"
+            echo "ROM: ${{ matrix.rom }}"
+          } | tee build-info.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload flashable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: A52s-BakaSU-${{ matrix.rom }}
+          path: '*.zip'
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+      - name: Upload logs and configuration
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ matrix.rom }}
+          path: |
+            build.log
+            build-info.txt
+            out/.config
+          include-hidden-files: true
+          retention-days: 14
