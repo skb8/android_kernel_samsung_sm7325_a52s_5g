@@ -379,7 +379,7 @@ rm -rf "${OUT_DIR}"
 success "Clean done"
 
 # Use the same compiler settings during configuration, build and modules_install.
-export ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1
+export ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 DISABLE_WRAPPER=1
 export CROSS_COMPILE=aarch64-linux-gnu-
 export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
 
@@ -394,6 +394,11 @@ if [[ "$ROOT_SOLUTION" == "BakaSU" ]]; then
     grep -qx 'CONFIG_KSU_MANUAL_HOOK=y' "$OUT_DIR/.config" || die "Manual hooks are disabled"
 fi
 success "Defconfig generated"
+
+# Install UAPI headers before BakaSU parses its preinit runner rules.
+make -C "$KERNEL_ROOT" O="$OUT_DIR" CC=clang \
+    headers_install INSTALL_HDR_PATH="$OUT_DIR/usr" \
+    || die "UAPI headers installation failed"
 
 # ─── Step 9: Kernel build ────────────────────────────────────────────────────
 info "Building kernel with $(nproc) jobs..."
