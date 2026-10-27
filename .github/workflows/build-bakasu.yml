@@ -90,12 +90,23 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev \
             curl git zip unzip cpio python3 kmod binutils-aarch64-linux-gnu \
-            binutils-arm-linux-gnueabi
+            binutils-arm-linux-gnueabi rsync
+      - name: Restore Clang toolchain
+        uses: actions/cache/restore@v4
+        with:
+          path: toolchain/clang
+          key: clang-r530567-linux-x86_64
       - name: Build kernel and flashable ZIP
         shell: bash
         run: |
           set -o pipefail
           bash build_kernel_zip.sh 2>&1 | tee build.log
+      - name: Cache Clang toolchain
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: toolchain/clang
+          key: clang-r530567-linux-x86_64
       - name: Record exact sources
         if: always()
         run: |
